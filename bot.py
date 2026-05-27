@@ -52,7 +52,8 @@ CREATE TABLE IF NOT EXISTS users (
     is_banned             BOOLEAN     NOT NULL DEFAULT FALSE,
     has_seen_all          BOOLEAN     NOT NULL DEFAULT FALSE,
     verify_slot           INT         NOT NULL DEFAULT 1,
-    last_new_vid_notif    BIGINT
+    last_new_vid_notif    BIGINT,
+    notif_pending         BOOLEAN     NOT NULL DEFAULT FALSE
 );
 CREATE TABLE IF NOT EXISTS verifications (
     id          SERIAL PRIMARY KEY,
@@ -99,6 +100,7 @@ async def init_db():
             "ALTER TABLE users ADD COLUMN IF NOT EXISTS has_seen_all BOOLEAN NOT NULL DEFAULT FALSE",
             "ALTER TABLE users ADD COLUMN IF NOT EXISTS verify_slot INT NOT NULL DEFAULT 1",
             "ALTER TABLE users ADD COLUMN IF NOT EXISTS last_new_vid_notif BIGINT",
+            "ALTER TABLE users ADD COLUMN IF NOT EXISTS notif_pending BOOLEAN NOT NULL DEFAULT FALSE",
         ]:
             try:
                 await conn.execute(m)
@@ -328,6 +330,7 @@ async def push_latest_to_seen_all(new_msg_id: int):
             """SELECT u.user_id FROM users u
                WHERE u.has_seen_all = TRUE
                  AND u.is_banned    = FALSE
+                 AND u.notif_pending = FALSE
                  AND NOT EXISTS (
                      SELECT 1 FROM user_history h
                      WHERE h.user_id = u.user_id AND h.message_id = $1
@@ -360,9 +363,9 @@ async def push_latest_to_seen_all(new_msg_id: int):
                     parse_mode="MarkdownV2",
                     reply_markup=markup,
                 )
-                # Save new notification message ID
+                # Save new notification message ID and mark pending
                 await conn.execute(
-                    "UPDATE users SET last_new_vid_notif=$1 WHERE user_id=$2",
+                    "UPDATE users SET last_new_vid_notif=$1, notif_pending=TRUE WHERE user_id=$2",
                     sent.message_id, uid,
                 )
         except TelegramForbiddenError:
@@ -505,7 +508,10 @@ async def cmd_start(message: types.Message):
             notif_id = row["last_new_vid_notif"]
             if notif_id:
                 asyncio.create_task(delete_after(user_id, notif_id, 10))
-                await conn.execute("UPDATE users SET last_new_vid_notif=NULL WHERE user_id=$1", user_id)
+                await conn.execute(
+                    "UPDATE users SET last_new_vid_notif=NULL, notif_pending=FALSE WHERE user_id=$1",
+                    user_id,
+                )
 
         # ── Normal /start ─────────────────────────────────────────────────
         video_ids = await get_video_ids()
