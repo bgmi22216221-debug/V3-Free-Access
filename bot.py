@@ -501,8 +501,11 @@ async def cmd_start(message: types.Message):
 
         # ── Notification deep-link: ?start=watch ──────────────────────────
         if payload == "watch":
-            # Just fall through to normal /start flow below (no special handling needed)
-            pass
+            # Delete the new-video notification after 10 seconds
+            notif_id = row["last_new_vid_notif"]
+            if notif_id:
+                asyncio.create_task(delete_after(user_id, notif_id, 10))
+                await conn.execute("UPDATE users SET last_new_vid_notif=NULL WHERE user_id=$1", user_id)
 
         # ── Normal /start ─────────────────────────────────────────────────
         video_ids = await get_video_ids()
