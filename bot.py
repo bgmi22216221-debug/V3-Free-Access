@@ -320,52 +320,53 @@ async def send_video(user_id, index, video_ids, conn):
 
 
 async def push_latest_to_seen_all(new_msg_id: int):
-    """Send a premium new-video notification to all users who have seen the full playlist."""
+    """Send ONE premium notification to users who have seen all videos.
+    Uses atomic UPDATE...RETURNING so even if 5 videos upload simultaneously,
+    only 1 notification goes out per user.
+    """
     video_ids = await get_video_ids()
     if not video_ids:
         return
 
+    # Atomically flip notif_pending FALSE->TRUE for eligible users.
+    # Only the first coroutine wins per user; rest find notif_pending=TRUE and skip.
     async with pool.acquire() as conn:
         rows = await conn.fetch(
-            """SELECT u.user_id FROM users u
-               WHERE u.has_seen_all = TRUE
-                 AND u.is_banned    = FALSE
-                 AND u.notif_pending = FALSE
-                 AND NOT EXISTS (
-                     SELECT 1 FROM user_history h
-                     WHERE h.user_id = u.user_id AND h.message_id = $1
-                 )""",
-            new_msg_id,
+            """UPDATE users
+               SET notif_pending = TRUE
+               WHERE has_seen_all  = TRUE
+                 AND is_banned     = FALSE
+                 AND notif_pending = FALSE
+               RETURNING user_id, last_new_vid_notif""",
         )
 
-    logger.info(f"push_latest (notify) mid={new_msg_id} → {len(rows)} eligible users")
+    logger.info(f"push_latest (notify) mid={new_msg_id} -> {len(rows)} eligible users")
+    if not rows:
+        return
 
-    # Build a "Watch Now" deep-link button that opens the bot
     watch_kb = InlineKeyboardBuilder()
-    watch_kb.button(text="▶️  Watch Now", url=f"https://t.me/{BOT_USERNAME}?start=watch")
+    watch_kb.button(text="\u25b6\ufe0f  Watch Now", url=f"https://t.me/{BOT_USERNAME}?start=watch")
     markup = watch_kb.as_markup()
 
     for row in rows:
-        uid = row["user_id"]
+        uid       = row["user_id"]
+        old_notif = row["last_new_vid_notif"]
         try:
-            async with pool.acquire() as conn:
-                user = await get_user(conn, uid)
-                # Delete previous new-video notification if it exists
-                await silent_delete(uid, user["last_new_vid_notif"])
+            await silent_delete(uid, old_notif)
 
-                sent = await bot.send_message(
-                    chat_id=uid,
-                    text=(
-                        "🔔 *New Video Just Dropped\\!* 🎬\n\n"
-                        "✨ _You've watched everything — and fresh content is here just for you\\._\n\n"
-                        "Tap below to watch it now before anyone else\\! 👇"
-                    ),
-                    parse_mode="MarkdownV2",
-                    reply_markup=markup,
-                )
-                # Save new notification message ID and mark pending
+            sent = await bot.send_message(
+                chat_id=uid,
+                text=(
+                    "🔔 *New Video Just Dropped\\!* 🎬\n\n"
+                    "✨ _You've watched everything — and fresh content is here just for you\\._\n\n"
+                    "Tap below to watch it now before anyone else\\! 👇"
+                ),
+                parse_mode="MarkdownV2",
+                reply_markup=markup,
+            )
+            async with pool.acquire() as conn:
                 await conn.execute(
-                    "UPDATE users SET last_new_vid_notif=$1, notif_pending=TRUE WHERE user_id=$2",
+                    "UPDATE users SET last_new_vid_notif=$1 WHERE user_id=$2",
                     sent.message_id, uid,
                 )
         except TelegramForbiddenError:
