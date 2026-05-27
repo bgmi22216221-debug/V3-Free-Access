@@ -49,9 +49,10 @@ CREATE TABLE IF NOT EXISTS users (
     last_verify_msg  BIGINT,
     last_video_msg   BIGINT,
     last_nav_msg     BIGINT,
-    is_banned        BOOLEAN     NOT NULL DEFAULT FALSE,
-    has_seen_all     BOOLEAN     NOT NULL DEFAULT FALSE,
-    verify_slot      INT         NOT NULL DEFAULT 1
+    is_banned             BOOLEAN     NOT NULL DEFAULT FALSE,
+    has_seen_all          BOOLEAN     NOT NULL DEFAULT FALSE,
+    verify_slot           INT         NOT NULL DEFAULT 1,
+    last_new_vid_notif    BIGINT
 );
 CREATE TABLE IF NOT EXISTS verifications (
     id          SERIAL PRIMARY KEY,
@@ -97,6 +98,7 @@ async def init_db():
             "ALTER TABLE users ADD COLUMN IF NOT EXISTS videos_watched INT NOT NULL DEFAULT 0",
             "ALTER TABLE users ADD COLUMN IF NOT EXISTS has_seen_all BOOLEAN NOT NULL DEFAULT FALSE",
             "ALTER TABLE users ADD COLUMN IF NOT EXISTS verify_slot INT NOT NULL DEFAULT 1",
+            "ALTER TABLE users ADD COLUMN IF NOT EXISTS last_new_vid_notif BIGINT",
         ]:
             try:
                 await conn.execute(m)
@@ -316,11 +318,10 @@ async def send_video(user_id, index, video_ids, conn):
 
 
 async def push_latest_to_seen_all(new_msg_id: int):
-    """Send newly added video to all users who have seen the full playlist."""
+    """Send a premium new-video notification to all users who have seen the full playlist."""
     video_ids = await get_video_ids()
     if not video_ids:
         return
-    new_index = len(video_ids) - 1
 
     async with pool.acquire() as conn:
         rows = await conn.fetch(
@@ -334,57 +335,40 @@ async def push_latest_to_seen_all(new_msg_id: int):
             new_msg_id,
         )
 
-    logger.info(f"push_latest mid={new_msg_id} → {len(rows)} eligible users")
+    logger.info(f"push_latest (notify) mid={new_msg_id} → {len(rows)} eligible users")
+
+    # Build a "Watch Now" deep-link button that opens the bot
+    watch_kb = InlineKeyboardBuilder()
+    watch_kb.button(text="▶️  Watch Now", url=f"https://t.me/{BOT_USERNAME}?start=watch")
+    markup = watch_kb.as_markup()
 
     for row in rows:
         uid = row["user_id"]
         try:
             async with pool.acquire() as conn:
-                # No access gate — push regardless of verification status
-                await delete_prev_video(uid, conn)
+                user = await get_user(conn, uid)
+                # Delete previous new-video notification if it exists
+                await silent_delete(uid, user["last_new_vid_notif"])
 
-                try:
-                    vid = await bot.copy_message(
-                        chat_id=uid,
-                        from_chat_id=CHANNEL_ID,
-                        message_id=new_msg_id,
-                        protect_content=True,
-                    )
-                except TelegramBadRequest as e:
-                    logger.warning(f"push_latest copy uid={uid}: {e}")
-                    continue
-
-                try:
-                    nav = await bot.send_message(
-                        chat_id=uid,
-                        text="🎬  *More videos below — keep going\\!*",
-                        parse_mode="MarkdownV2",
-                        reply_markup=nav_kb(new_index),
-                    )
-                except Exception:
-                    nav = None
-
-                nav_id = nav.message_id if nav else None
-
-                # Mark seen + reset has_seen_all (new content = not all seen anymore)
-                await mark_seen(conn, uid, new_msg_id)
-                await conn.execute(
-                    """UPDATE users
-                       SET last_video_msg=$1, last_nav_msg=$2,
-                           has_seen_all=FALSE, current_index=$3,
-                           videos_watched=videos_watched+1
-                       WHERE user_id=$4""",
-                    vid.message_id, nav_id, new_index, uid,
+                sent = await bot.send_message(
+                    chat_id=uid,
+                    text=(
+                        "🔔 *New Video Just Dropped\\!* 🎬\n\n"
+                        "✨ _You've watched everything — and fresh content is here just for you\\._\n\n"
+                        "Tap below to watch it now before anyone else\\! 👇"
+                    ),
+                    parse_mode="MarkdownV2",
+                    reply_markup=markup,
                 )
-
-                asyncio.create_task(delete_after(uid, vid.message_id, AUTO_DELETE_VIDEO))
-                if nav_id:
-                    asyncio.create_task(delete_after(uid, nav_id, AUTO_DELETE_VIDEO))
-
+                # Save new notification message ID
+                await conn.execute(
+                    "UPDATE users SET last_new_vid_notif=$1 WHERE user_id=$2",
+                    sent.message_id, uid,
+                )
         except TelegramForbiddenError:
             pass
         except Exception as e:
-            logger.warning(f"push_latest uid={uid}: {e}")
+            logger.warning(f"push_latest notify uid={uid}: {e}")
         await asyncio.sleep(0.05)
 
 
@@ -514,6 +498,11 @@ async def cmd_start(message: types.Message):
                         parse_mode="MarkdownV2",
                     )
                     return
+
+        # ── Notification deep-link: ?start=watch ──────────────────────────
+        if payload == "watch":
+            # Just fall through to normal /start flow below (no special handling needed)
+            pass
 
         # ── Normal /start ─────────────────────────────────────────────────
         video_ids = await get_video_ids()
